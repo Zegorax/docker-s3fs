@@ -49,3 +49,4 @@ jobs:
           export TAG
           export PLUGIN_PREFIX
           ./build-all.sh "$TAG"
+          ./build-all.sh latest
