@@ -17,9 +17,9 @@ RUN <<EOF
         curl-dev \
         unzip
 
-    curl -L https://github.com/s3fs-fuse/s3fs-fuse/archive/refs/tags/v1.94.zip -o s3fs-fuse.zip
+    curl -L https://github.com/s3fs-fuse/s3fs-fuse/archive/refs/tags/v1.97.zip -o s3fs-fuse.zip
     unzip s3fs-fuse.zip
-    cd s3fs-fuse-1.94
+    cd s3fs-fuse-1.97
     ./autogen.sh
     ./configure
     make -j
