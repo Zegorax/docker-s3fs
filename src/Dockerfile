@@ -1,6 +1,7 @@
-FROM golang:1.22-alpine AS build
+FROM golang:1.25-alpine3.24 AS build
 
 RUN <<EOF
+    set -eu
     apk update
     apk --no-cache add \
         ca-certificates \
@@ -13,7 +14,7 @@ RUN <<EOF
         autoconf \
         libxml2-dev \
         mailcap \
-        fuse-dev \
+        fuse3-dev \
         curl-dev \
         unzip
 
@@ -30,7 +31,7 @@ COPY src /src/
 
 RUN cd /src/ && CGO_ENABLED=0 GOOS=linux go build -o /docker-s3fs
 
-FROM alpine:latest
+FROM alpine:3.24
 
 LABEL org.opencontainers.image.title="aekis/docker-s3fs"
 LABEL org.opencontainers.image.description="Provides a Docker Volume Driver for Mounting Amazon S3 Buckets using S3FS"
@@ -42,7 +43,8 @@ LABEL org.opencontainers.image.source="https://github.com/aekis-dev/docker-s3fs/
 RUN <<EOF
     apk update
     apk --no-cache add \
-        fuse \
+        fuse3 \
+        fuse3-libs \
         libcurl \
         libxml2 \
         libgcc \
