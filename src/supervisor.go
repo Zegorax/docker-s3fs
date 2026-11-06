@@ -71,10 +71,10 @@ func isENOTCONN(err error) bool {
 
 // launch starts s3fs in the foreground and waits until the mount is live.
 func (s *s3fsProc) launch() (chan error, error) {
+	cleanStale(s.mountPoint) // must precede MkdirAll, which fails on a dead mount
 	if err := os.MkdirAll(s.mountPoint, 0755); err != nil {
 		return nil, err
 	}
-	cleanStale(s.mountPoint)
 
 	cmd := exec.Command("s3fs", append(append([]string{}, s.args...), "-f")...)
 	cmd.Env = s.env
