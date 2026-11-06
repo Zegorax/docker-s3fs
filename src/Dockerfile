@@ -22,7 +22,8 @@ RUN <<EOF
     unzip s3fs-fuse.zip
     cd s3fs-fuse-1.97
     ./autogen.sh
-    ./configure
+    # musl defaults to tiny thread stacks, which can crash s3fs under load
+    LDFLAGS="-Wl,-z,stack-size=8388608" ./configure
     make -j
     make install
 EOF

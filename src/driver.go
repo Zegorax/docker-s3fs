@@ -5,11 +5,8 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path"
-	"strings"
 	"sync"
-	"syscall"
 
 	"github.com/boltdb/bolt"
 	"github.com/docker/go-plugins-helpers/volume"
@@ -237,34 +234,15 @@ func (p *Driver) Mount(req *volume.MountRequest) (*volume.MountResponse, error) 
 		args = append(args, volumeInfo.Args...)
 	}
 	log.Println(args)
-	cmd := exec.Command(p.mountExecutable, args...)
 	new_env := os.Environ()
-
-	aws_key, aws_keyInOpts := volumeInfo.Options["AWS_ACCESS_KEY_ID"]
-	aws_secret, aws_secretInOpts := volumeInfo.Options["AWS_SECRET_ACCESS_KEY"]
-	aws_token, aws_tokenInOpts := volumeInfo.Options["AWS_SESSION_TOKEN"]
-
-	if aws_keyInOpts && aws_key != "" {
-		new_env = append(new_env, "AWS_ACCESS_KEY_ID="+aws_key)
-	}
-	if aws_secretInOpts && aws_secret != "" {
-		new_env = append(new_env, "AWS_SECRET_ACCESS_KEY="+aws_secret)
-	}
-	if aws_tokenInOpts && aws_token != "" {
-		new_env = append(new_env, "AWS_SESSION_TOKEN="+aws_token)
-	}
-	//fmt.Printf("new_env: %s\n", new_env)
-	cmd.Env = new_env
-
-	if out, err := cmd.CombinedOutput(); err != nil {
-		fmt.Printf("Command output: %s\n", out)
-		return &volume.MountResponse{}, fmt.Errorf("error mounting %s: %s", req.Name, err.Error())
-	} else {
-		cmd := exec.Command("df", "-T", mountPoint)
-		if out, err := cmd.CombinedOutput(); err != nil || strings.Index(string(out), p.mountExecutable) < 0 {
-			fmt.Printf("df -T: %s\n", out)
-			return &volume.MountResponse{}, fmt.Errorf("error mounting %s:\n%s\nfstype should be %s", req.Name, out, p.mountExecutable)
+	for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"} {
+		if v := volumeInfo.Options[k]; v != "" {
+			new_env = append(new_env, k+"="+v)
 		}
+	}
+
+	if err := startS3fs(mountPoint, args, new_env); err != nil {
+		return &volume.MountResponse{}, fmt.Errorf("error mounting %s: %s", req.Name, err.Error())
 	}
 	volumeInfo.MountPoint = mountPoint
 	volumeInfo.Status["mounted"] = true
@@ -296,20 +274,12 @@ func (p *Driver) Unmount(req *volume.UnmountRequest) error {
 	}
 
 	mountPoint := path.Join(volume.DefaultDockerRootDirectory, req.ID)
-	if err := syscall.Unmount(mountPoint, 0); err != nil {
-		errno := err.(syscall.Errno)
-		if errno == syscall.EINVAL {
-			log.Printf("error unmounting invalid mount %s: %s", req.Name, err.Error())
-		} else {
-			return fmt.Errorf("error unmounting %s: %s", req.Name, err.Error())
-		}
+	if err := stopS3fs(mountPoint); err != nil {
+		return fmt.Errorf("error unmounting %s: %s", req.Name, err.Error())
 	}
 	volumeInfo.MountPoint = ""
 	volumeInfo.Status["mounted"] = false
 
-	if err := os.Remove(mountPoint); err != nil {
-		return fmt.Errorf("error unmounting %s: %s", req.Name, err.Error())
-	}
 	p.storeVolumeInfo(tx, req.Name, volumeInfo)
 	return tx.Commit()
 }
