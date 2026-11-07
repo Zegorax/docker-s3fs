@@ -217,10 +217,9 @@ func (p *Driver) Mount(req *volume.MountRequest) (*volume.MountResponse, error) 
 		return &volume.MountResponse{}, getVolErr
 	}
 
+	// the directory is created by startS3fs, which also copes with a dead
+	// mount left there by an earlier plugin instance
 	mountPoint := path.Join(volume.DefaultDockerRootDirectory, req.ID)
-	if err := os.MkdirAll(mountPoint, 0755); err != nil {
-		return &volume.MountResponse{}, fmt.Errorf("error mounting %s: %s", req.Name, err.Error())
-	}
 
 	if err := p.PreMount(req); err != nil {
 		return &volume.MountResponse{}, fmt.Errorf("error mounting %s on premount: %s", req.Name, err.Error())

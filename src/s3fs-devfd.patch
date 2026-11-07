@@ -1,0 +1,21 @@
+--- a/src/s3fs.cpp
++++ b/src/s3fs.cpp
+@@ -5036,6 +5036,18 @@
+             stbuf = {};
+             set_mountpoint_attribute(stbuf);
+ #else
++            // docker-s3fs: "/dev/fd/N" means the caller has already mounted
++            // /dev/fuse and passes the connection fd (supported by libfuse
++            // >= 3.3). The mount point itself may be a dead mount underneath,
++            // so it must not be stat()ed.
++            if(0 == strncmp(arg, "/dev/fd/", 8)){
++                stbuf = {};
++                stbuf.st_mode = S_IFDIR | S_IRWXU | S_IRWXG | S_IRWXO;
++                stbuf.st_uid  = geteuid();
++                stbuf.st_gid  = getegid();
++                set_mountpoint_attribute(stbuf);
++                return 1;
++            }
+             if(stat(arg, &stbuf) == -1){
+                 // check stale mountpoint
+                 if(errno == ENOTCONN){

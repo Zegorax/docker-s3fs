@@ -15,13 +15,20 @@ import (
 const (
 	mountTimeout   = 30 * time.Second
 	maxRestartWait = 30 * time.Second
+	maxMountLayers = 64
 )
 
 // s3fsProc supervises one foreground s3fs process. If s3fs dies unexpectedly
-// the reason is logged, the dead mount is detached and s3fs is started again.
+// the reason is logged and a fresh s3fs is mounted on top of the dead mount.
+//
+// Why on top: a running container does not see the plugin's mount directly.
+// Its view of the volume is a slave copy of the original s3fs mount, so the
+// only mount events that reach it are mounts made on top of that mount. A new
+// mount beside it (after detaching the dead one) never reaches the container,
+// which then keeps failing with "transport endpoint is not connected".
 type s3fsProc struct {
 	mountPoint string
-	args       []string
+	args       []string // s3fs arguments, including the mount point
 	env        []string
 
 	mu      sync.Mutex
@@ -53,16 +60,6 @@ func isMounted(mountPoint string) bool {
 	return false
 }
 
-// cleanStale detaches a leftover mount whose FUSE daemon is gone
-// ("transport endpoint is not connected").
-func cleanStale(mountPoint string) {
-	if _, err := os.Stat(mountPoint); !isENOTCONN(err) {
-		return
-	}
-	log.Printf("detaching stale mount %s", mountPoint)
-	syscall.Unmount(mountPoint, syscall.MNT_DETACH)
-}
-
 func isENOTCONN(err error) bool {
 	if pe, ok := err.(*os.PathError); ok {
 		err = pe.Err
@@ -70,44 +67,108 @@ func isENOTCONN(err error) bool {
 	return err == syscall.ENOTCONN
 }
 
-// launch starts s3fs in the foreground and waits until the mount is live.
+// kernelMountOptions translates the s3fs "-o" options that the kernel (and not
+// s3fs) handles into mount flags and FUSE mount data, the way libfuse would.
+func kernelMountOptions(args []string) (uintptr, string) {
+	flags := uintptr(syscall.MS_NOSUID | syscall.MS_NODEV)
+	data := ""
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] != "-o" {
+			continue
+		}
+		for _, o := range strings.Split(args[i+1], ",") {
+			switch {
+			case o == "ro":
+				flags |= syscall.MS_RDONLY
+			case o == "suid":
+				flags &^= syscall.MS_NOSUID
+			case o == "dev":
+				flags &^= syscall.MS_NODEV
+			case o == "noexec":
+				flags |= syscall.MS_NOEXEC
+			case o == "allow_other", o == "default_permissions", strings.HasPrefix(o, "max_read="):
+				data += "," + o
+			}
+		}
+	}
+	return flags, data
+}
+
+// launch mounts a new FUSE connection on the mount point (on top of whatever
+// is there, dead or not) and starts s3fs serving it.
+//
+// The plugin does the mount syscall itself and hands the /dev/fuse fd to s3fs
+// as /dev/fd/3, because s3fs and libfuse stat() a mount point given by path,
+// which fails with ENOTCONN on a dead mount (see s3fs-devfd.patch).
 func (s *s3fsProc) launch() (chan error, error) {
-	cleanStale(s.mountPoint) // must precede MkdirAll, which fails on a dead mount
 	if err := os.MkdirAll(s.mountPoint, 0755); err != nil {
-		return nil, err
+		// a dead mount is fine: we mount on top of it
+		if _, serr := os.Lstat(s.mountPoint); !isENOTCONN(serr) {
+			return nil, err
+		}
 	}
 
-	cmd := exec.Command("s3fs", append(append([]string{}, s.args...), "-f")...)
+	fuse, err := os.OpenFile("/dev/fuse", os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	flags, extra := kernelMountOptions(s.args)
+	data := fmt.Sprintf("fd=%d,rootmode=40000,user_id=0,group_id=0%s", fuse.Fd(), extra)
+	if err := syscall.Mount("s3fs", s.mountPoint, "fuse.s3fs", flags, data); err != nil {
+		fuse.Close()
+		return nil, fmt.Errorf("mounting fuse on %s: %w", s.mountPoint, err)
+	}
+	// From here on, a failure must remove the mount we just added (the top one).
+	undo := func() { syscall.Unmount(s.mountPoint, syscall.MNT_DETACH) }
+
+	args := make([]string, 0, len(s.args)+1)
+	for _, a := range s.args {
+		if a == s.mountPoint {
+			a = "/dev/fd/3" // first entry of cmd.ExtraFiles
+		}
+		args = append(args, a)
+	}
+	cmd := exec.Command("s3fs", append(args, "-f")...)
 	cmd.Env = s.env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
+	cmd.ExtraFiles = []*os.File{fuse}
+	err = cmd.Start()
+	// s3fs must hold the only fd to the connection: then the kernel aborts it
+	// as soon as s3fs dies, instead of leaving requests hanging.
+	fuse.Close()
+	if err != nil {
+		undo()
 		return nil, err
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
-	deadline := time.After(mountTimeout)
-	tick := time.NewTicker(100 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		select {
-		case err := <-done:
-			return nil, fmt.Errorf("s3fs exited during mount: %s", describeExit(err))
-		case <-deadline:
-			cmd.Process.Kill()
-			<-done
-			return nil, fmt.Errorf("timed out waiting for s3fs to mount %s", s.mountPoint)
-		case <-tick.C:
-			if isMounted(s.mountPoint) {
-				s.mu.Lock()
-				s.cmd = cmd
-				s.started = time.Now()
-				s.mu.Unlock()
-				return done, nil
-			}
-		}
+	// Ready once the filesystem answers a request.
+	ready := make(chan error, 1)
+	go func() { _, err := os.Stat(s.mountPoint); ready <- err }()
+	fail := func(reason string) (chan error, error) {
+		cmd.Process.Kill()
+		<-done
+		undo()
+		return nil, fmt.Errorf("%s", reason)
 	}
+	select {
+	case err := <-done:
+		undo()
+		return nil, fmt.Errorf("s3fs exited during mount: %s", describeExit(err))
+	case err := <-ready:
+		if err != nil {
+			return fail(fmt.Sprintf("s3fs did not answer on %s: %s", s.mountPoint, err))
+		}
+	case <-time.After(mountTimeout):
+		return fail(fmt.Sprintf("timed out waiting for s3fs to mount %s", s.mountPoint))
+	}
+	s.mu.Lock()
+	s.cmd = cmd
+	s.started = time.Now()
+	s.mu.Unlock()
+	return done, nil
 }
 
 func describeExit(err error) string {
@@ -139,7 +200,7 @@ func (s *s3fsProc) supervise(done chan error) {
 		s.mu.Lock()
 		uptime := time.Since(s.started).Round(time.Second)
 		s.mu.Unlock()
-		log.Printf("s3fs for %s died unexpectedly after %s: %s (no unmount was requested; still in mount table: %v); restarting",
+		log.Printf("s3fs for %s died unexpectedly after %s: %s (no unmount was requested; still in mount table: %v); remounting on top",
 			s.mountPoint, uptime, describeExit(err), isMounted(s.mountPoint))
 		for {
 			time.Sleep(wait)
@@ -174,6 +235,20 @@ func startS3fs(mountPoint string, args, env []string) error {
 	return nil
 }
 
+// unmountAll removes every mount stacked on mountPoint (the live one and any
+// dead ones below it left by earlier crashes).
+func unmountAll(mountPoint string) error {
+	for i := 0; i < maxMountLayers && isMounted(mountPoint); i++ {
+		if err := syscall.Unmount(mountPoint, 0); err != nil && err != syscall.EINVAL && err != syscall.ENOENT {
+			// busy or dead mount: fall back to a lazy detach
+			if err := syscall.Unmount(mountPoint, syscall.MNT_DETACH); err != nil && err != syscall.EINVAL && err != syscall.ENOENT {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // stopS3fs unmounts mountPoint and stops its supervisor. It tolerates mounts
 // that are already gone or dead.
 func stopS3fs(mountPoint string) error {
@@ -187,12 +262,7 @@ func stopS3fs(mountPoint string) error {
 		s.mu.Unlock()
 	}
 
-	err := syscall.Unmount(mountPoint, 0)
-	if err != nil && err != syscall.EINVAL && err != syscall.ENOENT {
-		// busy or dead mount: fall back to a lazy detach
-		err = syscall.Unmount(mountPoint, syscall.MNT_DETACH)
-	}
-	if err != nil && err != syscall.EINVAL && err != syscall.ENOENT {
+	if err := unmountAll(mountPoint); err != nil {
 		if s != nil { // still mounted, keep supervising
 			s.mu.Lock()
 			s.stopped = false
