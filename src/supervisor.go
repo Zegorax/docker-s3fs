@@ -26,6 +26,7 @@ type s3fsProc struct {
 
 	mu      sync.Mutex
 	cmd     *exec.Cmd
+	started time.Time
 	stopped bool
 	exited  chan struct{} // closed when the supervisor goroutine returns
 }
@@ -101,6 +102,7 @@ func (s *s3fsProc) launch() (chan error, error) {
 			if isMounted(s.mountPoint) {
 				s.mu.Lock()
 				s.cmd = cmd
+				s.started = time.Now()
 				s.mu.Unlock()
 				return done, nil
 			}
@@ -134,7 +136,11 @@ func (s *s3fsProc) supervise(done chan error) {
 		if s.isStopped() {
 			return
 		}
-		log.Printf("s3fs for %s died unexpectedly: %s; restarting", s.mountPoint, describeExit(err))
+		s.mu.Lock()
+		uptime := time.Since(s.started).Round(time.Second)
+		s.mu.Unlock()
+		log.Printf("s3fs for %s died unexpectedly after %s: %s (no unmount was requested; still in mount table: %v); restarting",
+			s.mountPoint, uptime, describeExit(err), isMounted(s.mountPoint))
 		for {
 			time.Sleep(wait)
 			if s.isStopped() {

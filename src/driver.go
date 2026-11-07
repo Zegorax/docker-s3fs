@@ -199,6 +199,7 @@ func (p *Driver) Path(req *volume.PathRequest) (*volume.PathResponse, error) {
 
 // Mount performs the mount operation.  This will invoke the mount executable.
 func (p *Driver) Mount(req *volume.MountRequest) (*volume.MountResponse, error) {
+	log.Printf("Mount request: volume=%s id=%s", req.Name, req.ID)
 	p.m.Lock()
 	defer p.m.Unlock()
 
@@ -256,6 +257,7 @@ func (p *Driver) Mount(req *volume.MountRequest) (*volume.MountResponse, error) 
 // call comes with EINVAL then this will log the error but will not fail the
 // operation.
 func (p *Driver) Unmount(req *volume.UnmountRequest) error {
+	log.Printf("Unmount request: volume=%s id=%s", req.Name, req.ID)
 	p.m.Lock()
 	defer p.m.Unlock()
 
