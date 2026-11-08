@@ -1,5 +1,8 @@
 FROM golang:1.25-alpine3.24 AS build
 
+# lets s3fs take an already-mounted /dev/fuse fd (see supervisor.go)
+COPY src/s3fs-devfd.patch /s3fs-devfd.patch
+
 RUN <<EOF
     set -eu
     apk update
@@ -21,6 +24,7 @@ RUN <<EOF
     curl -L https://github.com/s3fs-fuse/s3fs-fuse/archive/refs/tags/v1.97.zip -o s3fs-fuse.zip
     unzip s3fs-fuse.zip
     cd s3fs-fuse-1.97
+    patch -p1 < /s3fs-devfd.patch
     ./autogen.sh
     # musl defaults to tiny thread stacks, which can crash s3fs under load
     LDFLAGS="-Wl,-z,stack-size=8388608" ./configure

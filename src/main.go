@@ -2,9 +2,12 @@ package main
 
 import (
 	"errors"
+	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/docker/go-plugins-helpers/volume"
 )
@@ -64,7 +67,21 @@ func spawnSyslog() {
 	cmd.Start()
 }
 
+// logSignals records signals sent to the plugin (e.g. by a host process or
+// dockerd) and then lets the default action proceed.
+func logSignals() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	go func() {
+		sig := <-ch
+		log.Printf("plugin received signal %s", sig)
+		signal.Reset(sig)
+		syscall.Kill(os.Getpid(), sig.(syscall.Signal))
+	}()
+}
+
 func main() {
+	logSignals()
 	spawnSyslog()
 	//log.SetFlags(0)
 	d := buildDriver()

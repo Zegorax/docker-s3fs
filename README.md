@@ -66,6 +66,22 @@ You could use the following command to manually create the volume:
     
     docker volume create --driver aekis/docker-s3fs --opt bucket=bucket --opt AWS_ACCESS_KEY_ID=AWS_ACCESS_KEY_ID --opt AWS_SECRET_ACCESS_KEY=AWS_SECRET_ACCESS_KEY --opt o=rw,allow_other,umask=000,complement_stat,compat_dir,endpoint=us-east-1,dev,suid volume_name
 
+## Recovery when s3fs dies
+
+Each container mount is served by its own s3fs process, supervised by the plugin. If s3fs dies,
+the plugin logs why (`died unexpectedly after <uptime>: <exit status or signal>`) and mounts a fresh
+s3fs on top of the dead mount. The new mount propagates into the running container, so after a
+second or so the container can use the volume again without being restarted.
+
+Limits:
+
+* Requests in flight at the moment s3fs dies fail with `Transport endpoint is not connected`
+  (`Socket not connected` in musl/Alpine-based containers). Data that s3fs had not yet uploaded is lost.
+* Files that were open, and a working directory inside the volume, stay on the dead mount. Reopen
+  files by path (and `cd` again) to use the new mount.
+* If the plugin itself restarts (`docker plugin disable`, Docker daemon restart), every s3fs stops with it
+  and the containers using its volumes have to be restarted.
+
 ## Motivation
 
 Existing Solutions involves creating one plugin per AWS Credentials, which is not practical when you need to manage multiple AWS Accounts.

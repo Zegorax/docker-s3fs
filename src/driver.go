@@ -199,6 +199,7 @@ func (p *Driver) Path(req *volume.PathRequest) (*volume.PathResponse, error) {
 
 // Mount performs the mount operation.  This will invoke the mount executable.
 func (p *Driver) Mount(req *volume.MountRequest) (*volume.MountResponse, error) {
+	log.Printf("Mount request: volume=%s id=%s", req.Name, req.ID)
 	p.m.Lock()
 	defer p.m.Unlock()
 
@@ -216,10 +217,9 @@ func (p *Driver) Mount(req *volume.MountRequest) (*volume.MountResponse, error) 
 		return &volume.MountResponse{}, getVolErr
 	}
 
+	// the directory is created by startS3fs, which also copes with a dead
+	// mount left there by an earlier plugin instance
 	mountPoint := path.Join(volume.DefaultDockerRootDirectory, req.ID)
-	if err := os.MkdirAll(mountPoint, 0755); err != nil {
-		return &volume.MountResponse{}, fmt.Errorf("error mounting %s: %s", req.Name, err.Error())
-	}
 
 	if err := p.PreMount(req); err != nil {
 		return &volume.MountResponse{}, fmt.Errorf("error mounting %s on premount: %s", req.Name, err.Error())
@@ -256,6 +256,7 @@ func (p *Driver) Mount(req *volume.MountRequest) (*volume.MountResponse, error) 
 // call comes with EINVAL then this will log the error but will not fail the
 // operation.
 func (p *Driver) Unmount(req *volume.UnmountRequest) error {
+	log.Printf("Unmount request: volume=%s id=%s", req.Name, req.ID)
 	p.m.Lock()
 	defer p.m.Unlock()
 
