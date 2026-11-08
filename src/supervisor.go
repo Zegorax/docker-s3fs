@@ -37,6 +37,7 @@ type s3fsProc struct {
 	cmd      *exec.Cmd
 	started  time.Time
 	stopped  bool
+	refs     int           // Mount requests not yet matched by an Unmount (guarded by procsMu)
 	exited   chan struct{} // closed when the supervisor goroutine returns
 }
 
@@ -167,7 +168,14 @@ func (s *s3fsProc) launch() (chan error, error) {
 		return nil, fmt.Errorf("s3fs exited during mount: %s", describeExit(err))
 	case err := <-ready:
 		if err != nil {
-			log.Printf("first request on %s failed: %s", s.mountPoint, err)
+			// usually s3fs exiting at startup (bad options, credentials, disk space)
+			select {
+			case exitErr := <-done:
+				undo()
+				return nil, fmt.Errorf("s3fs exited during mount: %s", describeExit(exitErr))
+			case <-time.After(2 * time.Second):
+				log.Printf("first request on %s failed: %s", s.mountPoint, err)
+			}
 		}
 	case <-time.After(startGrace):
 		log.Printf("s3fs for %s has not answered after %s; leaving it running", s.mountPoint, startGrace)
@@ -237,8 +245,24 @@ func (s *s3fsProc) supervise(done chan error) {
 }
 
 // startS3fs mounts and begins supervising s3fs for mountPoint.
+//
+// Docker can send several Mount requests for the same ID while a container
+// runs (docker cp, for example, mounts the container's volumes again). They
+// share the existing mount: mounting another s3fs on top and tearing all
+// layers down at the matching Unmount would leave the running container on an
+// s3fs the plugin no longer tracks, which could then never be recovered.
 func startS3fs(mountPoint string, args, env []string) error {
-	s := &s3fsProc{mountPoint: mountPoint, args: args, env: env, exited: make(chan struct{})}
+	procsMu.Lock()
+	if s := procs[mountPoint]; s != nil {
+		s.refs++
+		n := s.refs
+		procsMu.Unlock()
+		log.Printf("%s is already mounted; sharing it (%d users)", mountPoint, n)
+		return nil
+	}
+	procsMu.Unlock()
+
+	s := &s3fsProc{mountPoint: mountPoint, args: args, env: env, exited: make(chan struct{}), refs: 1}
 	done, err := s.launch()
 	if err != nil {
 		return err
@@ -269,6 +293,13 @@ func unmountAll(mountPoint string) error {
 func stopS3fs(mountPoint string) error {
 	procsMu.Lock()
 	s := procs[mountPoint]
+	if s != nil && s.refs > 1 {
+		s.refs--
+		n := s.refs
+		procsMu.Unlock()
+		log.Printf("%s is still used by %d mount request(s); keeping it", mountPoint, n)
+		return nil
+	}
 	procsMu.Unlock()
 
 	if s != nil {

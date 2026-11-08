@@ -30,7 +30,7 @@ func TestSupervisorSurvivesKill(t *testing.T) {
 
 	mp := filepath.Join(base, "mnt")
 	env := append(os.Environ(), "AWS_ACCESS_KEY_ID="+envOr("S3FS_TEST_KEY", "a"), "AWS_SECRET_ACCESS_KEY="+envOr("S3FS_TEST_SECRET", "b"))
-	args := []string{mp, "-o", "allow_other,use_path_request_style,url=" + ep + ",bucket=" + bucket}
+	args := []string{mp, "-o", "allow_other,use_path_request_style,ensure_diskfree=0,url=" + ep + ",bucket=" + bucket}
 	if err := startS3fs(mp, args, env); err != nil {
 		t.Fatal(err)
 	}
@@ -69,6 +69,23 @@ func TestSupervisorSurvivesKill(t *testing.T) {
 		}
 		t.Logf("round %d: container view recovered: %q via s3fs pid %d", round, read(view), s3fsPid(t, mp))
 	}
+
+	// A second Mount request for the same ID (docker cp does this) and its
+	// Unmount must leave the running container's mount alone and recoverable.
+	must(t, startS3fs(mp, args, env))
+	must(t, stopS3fs(mp))
+	if got := read(view); got != "hi" || !isMounted(mp) {
+		t.Fatalf("after a second mount/unmount pair: view %q, mounted %v", got, isMounted(mp))
+	}
+	must(t, syscall.Kill(s3fsPid(t, mp), syscall.SIGKILL))
+	deadline := time.Now().Add(20 * time.Second)
+	for read(view) != "hi" {
+		if time.Now().After(deadline) {
+			t.Fatalf("container view did not recover after a mount/unmount pair: %s", read(view))
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Log("second mount/unmount pair for the same ID: container view kept working and still recovers")
 
 	// Writes through the recovered view must work too.
 	must(t, os.WriteFile(view+"/after-recovery.txt", []byte("ok"), 0644))
