@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -13,7 +14,7 @@ import (
 )
 
 const (
-	mountTimeout   = 30 * time.Second
+	startGrace     = 10 * time.Second
 	maxRestartWait = 30 * time.Second
 	maxMountLayers = 64
 )
@@ -31,12 +32,15 @@ type s3fsProc struct {
 	args       []string // s3fs arguments, including the mount point
 	env        []string
 
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	started time.Time
-	stopped bool
-	exited  chan struct{} // closed when the supervisor goroutine returns
+	launchMu sync.Mutex // held by launch and stopS3fs: a stop never overlaps a (re)mount
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	started  time.Time
+	stopped  bool
+	exited   chan struct{} // closed when the supervisor goroutine returns
 }
+
+var errStopped = errors.New("unmount requested")
 
 var (
 	procsMu sync.Mutex
@@ -101,6 +105,11 @@ func kernelMountOptions(args []string) (uintptr, string) {
 // as /dev/fd/3, because s3fs and libfuse stat() a mount point given by path,
 // which fails with ENOTCONN on a dead mount (see s3fs-devfd.patch).
 func (s *s3fsProc) launch() (chan error, error) {
+	s.launchMu.Lock()
+	defer s.launchMu.Unlock()
+	if s.isStopped() {
+		return nil, errStopped
+	}
 	if err := os.MkdirAll(s.mountPoint, 0755); err != nil {
 		// a dead mount is fine: we mount on top of it
 		if _, serr := os.Lstat(s.mountPoint); !isENOTCONN(serr) {
@@ -144,25 +153,28 @@ func (s *s3fsProc) launch() (chan error, error) {
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
-	// Ready once the filesystem answers a request.
+	// The kernel queues the container's requests until s3fs answers them, so
+	// once s3fs is running the mount is usable. Only an early exit is a
+	// failure: the first answer can take tens of seconds on a slow backend or
+	// when a busy container floods the fresh mount, and killing s3fs for that
+	// would only restart the cycle.
+	start := time.Now()
 	ready := make(chan error, 1)
 	go func() { _, err := os.Stat(s.mountPoint); ready <- err }()
-	fail := func(reason string) (chan error, error) {
-		cmd.Process.Kill()
-		<-done
-		undo()
-		return nil, fmt.Errorf("%s", reason)
-	}
 	select {
 	case err := <-done:
 		undo()
 		return nil, fmt.Errorf("s3fs exited during mount: %s", describeExit(err))
 	case err := <-ready:
 		if err != nil {
-			return fail(fmt.Sprintf("s3fs did not answer on %s: %s", s.mountPoint, err))
+			log.Printf("first request on %s failed: %s", s.mountPoint, err)
 		}
-	case <-time.After(mountTimeout):
-		return fail(fmt.Sprintf("timed out waiting for s3fs to mount %s", s.mountPoint))
+	case <-time.After(startGrace):
+		log.Printf("s3fs for %s has not answered after %s; leaving it running", s.mountPoint, startGrace)
+		go func() {
+			err := <-ready
+			log.Printf("s3fs for %s answered after %s (err: %v)", s.mountPoint, time.Since(start).Round(time.Second), err)
+		}()
 	}
 	s.mu.Lock()
 	s.cmd = cmd
@@ -208,6 +220,9 @@ func (s *s3fsProc) supervise(done chan error) {
 				return
 			}
 			newDone, err := s.launch()
+			if err == errStopped {
+				return
+			}
 			if err == nil {
 				done, wait = newDone, time.Second
 				log.Printf("s3fs for %s restarted", s.mountPoint)
@@ -260,9 +275,15 @@ func stopS3fs(mountPoint string) error {
 		s.mu.Lock()
 		s.stopped = true
 		s.mu.Unlock()
+		// wait for an in-flight remount to finish, so it cannot add a layer
+		// after unmountAll has run
+		s.launchMu.Lock()
 	}
-
-	if err := unmountAll(mountPoint); err != nil {
+	err := unmountAll(mountPoint)
+	if s != nil {
+		s.launchMu.Unlock()
+	}
+	if err != nil {
 		if s != nil { // still mounted, keep supervising
 			s.mu.Lock()
 			s.stopped = false
