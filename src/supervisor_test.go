@@ -87,6 +87,25 @@ func TestSupervisorSurvivesKill(t *testing.T) {
 	}
 	t.Log("second mount/unmount pair for the same ID: container view kept working and still recovers")
 
+	// The kernel aborts the FUSE connection (e.g. a request exceeded
+	// fs.fuse.*_request_timeout) while s3fs keeps running: it is paused here so
+	// it cannot notice and exit. The supervisor must detect the abort itself.
+	if _, err := os.Stat("/sys/fs/fuse/connections"); err == nil {
+		syscall.Mount("fusectl", "/sys/fs/fuse/connections", "fusectl", 0, "")
+	}
+	pid := s3fsPid(t, mp)
+	must(t, syscall.Kill(pid, syscall.SIGSTOP))
+	must(t, os.WriteFile("/sys/fs/fuse/connections/"+fuseConn(t, mp)+"/abort", []byte("1"), 0200))
+	t.Logf("aborted the FUSE connection while s3fs pid %d is still alive; view: %s", pid, read(view))
+	deadline = time.Now().Add(30 * time.Second)
+	for read(view) != "hi" {
+		if time.Now().After(deadline) {
+			t.Fatalf("container view did not recover after a connection abort: %s", read(view))
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Logf("connection abort with s3fs alive: container view recovered via s3fs pid %d", s3fsPid(t, mp))
+
 	// Writes through the recovered view must work too.
 	must(t, os.WriteFile(view+"/after-recovery.txt", []byte("ok"), 0644))
 	if b, err := os.ReadFile(mp + "/after-recovery.txt"); err != nil || string(b) != "ok" {
@@ -163,4 +182,21 @@ func must(t *testing.T, err error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+// fuseConn returns the FUSE connection number (device minor) of the top mount on mp.
+func fuseConn(t *testing.T, mp string) string {
+	b, err := os.ReadFile("/proc/self/mountinfo")
+	must(t, err)
+	conn := ""
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) > 4 && f[4] == mp {
+			conn = strings.SplitN(f[2], ":", 2)[1] // last one listed is the top
+		}
+	}
+	if conn == "" {
+		t.Fatal("no mount on " + mp)
+	}
+	return conn
 }

@@ -80,8 +80,20 @@ func logSignals() {
 	}()
 }
 
+// logFuseTimeouts records the kernel's FUSE request timeouts (Linux 6.14+).
+// When set, a FUSE request that takes longer (e.g. a lookup stuck behind a big
+// upload) makes the kernel abort the whole connection.
+func logFuseTimeouts() {
+	for _, name := range []string{"default_request_timeout", "max_request_timeout"} {
+		if b, err := os.ReadFile("/proc/sys/fs/fuse/" + name); err == nil {
+			log.Printf("kernel fs.fuse.%s = %s", name, strings.TrimSpace(string(b)))
+		}
+	}
+}
+
 func main() {
 	logSignals()
+	logFuseTimeouts()
 	spawnSyslog()
 	//log.SetFlags(0)
 	d := buildDriver()

@@ -17,6 +17,12 @@ const (
 	startGrace     = 10 * time.Second
 	maxRestartWait = 30 * time.Second
 	maxMountLayers = 64
+
+	// How often the supervisor checks that the kernel has not aborted the FUSE
+	// connection of a running s3fs, and how long one check may take before it
+	// is treated as "busy" rather than "aborted".
+	probeInterval = 5 * time.Second
+	probeTimeout  = 3 * time.Second
 )
 
 // s3fsProc supervises one foreground s3fs process. If s3fs dies unexpectedly
@@ -209,19 +215,72 @@ func (s *s3fsProc) isStopped() bool {
 	return s.stopped
 }
 
+// connectionAborted reports whether the kernel has aborted the FUSE
+// connection behind the mount point. That happens for example when a request
+// exceeds the kernel's FUSE request timeout (fs.fuse.*_request_timeout): every
+// access then fails with ENOTCONN, but s3fs itself can keep running for
+// minutes (it notices only when it next reads from /dev/fuse), so waiting for
+// it to exit would leave the containers broken all that time.
+//
+// statfs is always sent to s3fs, which answers it without contacting S3. A
+// probe that does not answer in time means s3fs is busy, not aborted; it is
+// kept and collected on a later call, so at most one probe is in flight.
+func (s *s3fsProc) connectionAborted(probe *chan error) bool {
+	if *probe == nil {
+		ch := make(chan error, 1)
+		*probe = ch
+		go func() {
+			var st syscall.Statfs_t
+			ch <- syscall.Statfs(s.mountPoint, &st)
+		}()
+	}
+	select {
+	case err := <-*probe:
+		*probe = nil
+		return err == syscall.ENOTCONN || err == syscall.ECONNABORTED
+	case <-time.After(probeTimeout):
+		return false
+	}
+}
+
 func (s *s3fsProc) supervise(done chan error) {
 	defer close(s.exited)
 	wait := time.Second
+	tick := time.NewTicker(probeInterval)
+	defer tick.Stop()
 	for {
-		err := <-done
+		var err error
+		var probe chan error
+		aborted := false
+	running:
+		for {
+			select {
+			case err = <-done:
+				break running
+			case <-tick.C:
+				if aborted || s.isStopped() || !s.connectionAborted(&probe) {
+					continue
+				}
+				aborted = true
+				s.mu.Lock()
+				log.Printf("FUSE connection of %s was aborted by the kernel while s3fs (pid %d) is still running; restarting s3fs",
+					s.mountPoint, s.cmd.Process.Pid)
+				s.cmd.Process.Kill()
+				s.mu.Unlock()
+			}
+		}
 		if s.isStopped() {
 			return
 		}
 		s.mu.Lock()
 		uptime := time.Since(s.started).Round(time.Second)
 		s.mu.Unlock()
-		log.Printf("s3fs for %s died unexpectedly after %s: %s (no unmount was requested; still in mount table: %v); remounting on top",
-			s.mountPoint, uptime, describeExit(err), isMounted(s.mountPoint))
+		cause := "no unmount was requested"
+		if aborted {
+			cause = "killed by the supervisor after its FUSE connection was aborted"
+		}
+		log.Printf("s3fs for %s died unexpectedly after %s: %s (%s; still in mount table: %v); remounting on top",
+			s.mountPoint, uptime, describeExit(err), cause, isMounted(s.mountPoint))
 		for {
 			time.Sleep(wait)
 			if s.isStopped() {
